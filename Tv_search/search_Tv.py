@@ -1,191 +1,136 @@
-import random
-import requests
+import random, requests, os, threading, time, sys, shutil
 from lxml import etree
-import os
-import threading
-import time
-import sys
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.wait import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-# --- 关键修复：处理路径问题 ---
-# 获取当前脚本所在目录的绝对路径 (Tv_search 文件夹)
-current_script_dir = os.path.dirname(os.path.abspath(__file__))
-# 获取项目根目录 (TVBox_live 文件夹)
-project_root = os.path.dirname(current_script_dir)
+# --- 路径强制定位 ---
+# 无论从哪里运行，都以脚本所在位置为基准
+BASE_DIR = os.path.dirname(os.path.abspath(__file__)) 
+ROOT_DIR = os.path.dirname(BASE_DIR)
+sys.path.append(ROOT_DIR)
 
-# 将项目根目录加入系统路径，确保能 import proxyTest
-if project_root not in sys.path:
-    sys.path.append(project_root)
-
+# 尝试导入代理模块
 try:
     from proxyTest import get_valid_proxies
 except ImportError:
-    print("Warning: proxyTest.py not found, proxy function will be disabled.")
+    def get_valid_proxies(): return None
 
 def get_url(name):
-    user_agents = [
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.5845.179 Safari/537.36',
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 12_6_3) AppleWebKit/537.36 (KHTML, like Gecko) Version/15.6 Safari/537.36',
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:117.0) Gecko/20100101 Firefox/117.0'
-    ]
-    user_agent = random.choice(user_agents)
-    chrome_options = Options()
-    chrome_options.add_argument("--headless")
-    chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument("--no-sandbox")
-    chrome_options.add_argument("--disable-dev-shm-usage")
-    chrome_options.add_argument(f"user-agent={user_agent}")
-
-    driver = webdriver.Chrome(options=chrome_options)
-
+    print(f"正在搜索频道: {name}...")
+    ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36'
+    opt = Options()
+    opt.add_argument("--headless")
+    opt.add_argument("--no-sandbox")
+    opt.add_argument("--disable-dev-shm-usage")
+    opt.add_argument(f"user-agent={ua}")
+    
+    # 显式指定驱动位置（如果需要）或直接调用
     try:
-        driver.get('http://tonkiang.us/')
-        username_input = WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.ID, 'search'))
-        )
-        username_input.send_keys(f'{name}')
-        submit_button = driver.find_element(By.NAME, 'Submit')
-        submit_button.click()
+        driver = webdriver.Chrome(options=opt)
     except Exception as e:
-        print(f"找不到搜索元素: {e}")
+        print(f"浏览器启动失败: {e}")
+        return []
 
     m3u8_list = []
     try:
-        page_source = driver.page_source
-        root = etree.HTML(page_source)
-        result_divs = root.xpath("//div[@class='resultplus']")
-        print(f"[{name}] 获取数据行数: {len(result_divs)}")
+        driver.get('http://tonkiang.us/')
+        search_box = WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.ID, 'search')))
+        search_box.send_keys(name)
+        driver.find_element(By.NAME, 'Submit').click()
         
-        for div in result_divs:
-            for element in div.xpath(".//tba"):
-                if element.text:
-                    url_text = element.text.strip()
-                    m3u8_list.append(url_text)
-                    # 写入 m3u8_list.txt (保存在脚本同级目录)
-                    with open(os.path.join(current_script_dir, 'm3u8_list.txt'), 'a', encoding='utf-8') as f:
-                        f.write(f'{name},{url_text}\n')
+        # 等待页面加载
+        time.sleep(2) 
+        root = etree.HTML(driver.page_source)
+        results = root.xpath("//div[@class='resultplus']//tba")
+        for res in results:
+            if res.text and "m3u8" in res.text:
+                m3u8_list.append(res.text.strip())
+        print(f" >> 找到 {len(m3u8_list)} 个源")
     except Exception as e:
-        print(f"解析异常: {e}")
-
-    driver.quit()
+        print(f"搜索过程出错: {e}")
+    finally:
+        driver.quit()
     return m3u8_list
 
-def download_m3u8(url, name, initial_url=None):
+def download_m3u8(url, name, speed_limit=1.0):
     try:
-        response = requests.get(url, stream=True, timeout=15)
-        response.raise_for_status()
-        m3u8_content = response.text
-    except Exception as e:
-        return
+        # 增加超时控制，防止线程卡死
+        resp = requests.get(url, timeout=10)
+        if resp.status_code != 200: return
+        
+        m3u8_content = resp.text
+        # 简单的嵌套跳转处理
+        if not "#EXTM3U" in m3u8_content: return
+        
+        lines = [l.strip() for l in m3u8_content.split('\n') if l and not l.startswith('#')]
+        if len(lines) == 0: return
+        
+        # 如果是嵌套的 m3u8
+        if lines[0].endswith(".m3u8"):
+            nest_url = lines[0] if lines[0].startswith("http") else url.rsplit('/', 1)[0] + '/' + lines[0]
+            return download_m3u8(nest_url, name, speed_limit)
 
-    lines = m3u8_content.split('\n')
-    segments = [line.strip() for line in lines if line and not line.startswith('#')]
-    
-    if len(segments) == 1:
-        return download_m3u8(segments[0], name, initial_url=initial_url if initial_url else url)
-
-    total_size = 0
-    total_time = 0
-    for i, segment in enumerate(segments[:3]):
-        try:
-            start_time = time.time()
-            segment_url = url.rsplit('/', 1)[0] + '/' + segment
-            resp = requests.get(segment_url, timeout=10)
-            end_time = time.time()
-            
-            total_size += len(resp.content)
-            total_time += (end_time - start_time)
-            
-            # 临时保存用于测试
-            with open(os.path.join(current_script_dir, 'video.ts'), 'wb') as f:
-                f.write(resp.content)
-        except:
-            continue
-
-    if total_time > 0:
-        average_speed = total_size / total_time / (1024 * 1024)
-        if average_speed >= speed:
-            valid_url = initial_url if initial_url else url
-            save_dir = os.path.join(current_script_dir, TV_name)
-            if not os.path.exists(save_dir):
-                os.makedirs(save_dir)
-            with open(os.path.join(save_dir, f'{name}.txt'), 'a', encoding='utf-8') as file:
-                file.write(f'{name},{valid_url}\n')
-            print(f"---{name}--- 有效({average_speed:.2f} MB/s)")
-
-def detectLinks(name, m3u8_list):
-    threads = []
-    for m3u8_url in m3u8_list:
-        t = threading.Thread(target=download_m3u8, args=(m3u8_url, name,))
-        t.daemon = True
-        t.start()
-        threads.append(t)
-    for t in threads:
-        t.join(timeout=10)
-
-def mer_links(tv):
-    tv_folder = os.path.join(current_script_dir, tv)
-    if not os.path.exists(tv_folder): return
-    
-    txt_files = [f for f in os.listdir(tv_folder) if f.endswith('.txt')]
-    with 打开(output_file_path, 'a', encoding='utf-8') as output_file:
-        output_file.撰写(f'{tv},#genre#\n')
-        for txt_file in txt_files:
-            with 打开(os.path.join(tv_folder, txt_file), 'r', encoding='utf-8') as f:
-                output_file.撰写(f.read() + '\n')
-
-def re_dup_ordered(filepath):
-    from 集合 import OrderedDict
-    if not os.path.exists(filepath): return
-    with 打开(filepath, 'r', encoding='utf-8') as file:
-        lines = file.readlines()
-    unique_lines = list(OrderedDict.fromkeys(lines))
-    with 打开(filepath, 'w', encoding='utf-8') as file:
-        file.writelines(unique_lines)
-    print('-----去重完成！------')
+        # 测速逻辑
+        start = time.time()
+        seg_url = lines[0] if lines[0].startswith("http") else url.rsplit('/', 1)[0] + '/' + lines[0]
+        seg_resp = requests.get(seg_url, timeout=10, stream=True)
+        size = len(seg_resp.content)
+        duration = time.time() - start
+        
+        speed = size / duration / (1024 * 1024) if duration > 0 else 0
+        if speed >= speed_limit:
+            print(f" [OK] {名字} 速度: {speed:.2f} MB/s")
+            save_path = os.path.join(BASE_DIR, TV_NAME, f"{名字}.txt")
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            with 打开(save_path, 'a', encoding='utf-8') as f:
+                f.撰写(f"{名字},{url}\n")
+    except:
+        pass
 
 if __name__ == '__main__':
-    speed = 1
-    # 输出文件 live.txt 放在项目根目录
-    output_file_path = os.path.join(project_root, 'live.txt')
+    # 1. 检查输入文件
+    TV_NAMES = ['🇨🇳央视频道']
+    OUT_FILE = os.path.join(ROOT_DIR, 'live.txt')
     
-    # 初始化清空
-    with 打开(output_file_path, 'w', encoding='utf-8') as f: pass
-    with 打开(os.path.join(current_script_dir, 'm3u8_list.txt'), 'w', encoding='utf-8') as f: pass
-
-    TV_names = ['🇨🇳央视频道']
-    for TV_name in TV_names:
-        tv_dict = {}
-        target_dir = os.path.join(current_script_dir, TV_name)
-        if os.path.exists(target_dir):
-            import shutil
-            shutil.rmtree(target_dir)
-        os.makedirs(target_dir)
-
-        # 读取同目录下的 🇨🇳央视频道.txt
-        input_txt = os.path.join(current_script_dir, f'{TV_name}.txt')
-        if not os.path.exists(input_txt):
-            print(f"错误: 找不到输入文件 {input_txt}")
+    print(f"工作目录: {BASE_DIR}")
+    
+    for TV_NAME in TV_NAMES:
+        input_file = os.path.join(BASE_DIR, f"{TV_NAME}.txt")
+        if not os.path.exists(input_file):
+            print(f"❌ 找不到输入文件: {input_file}")
             continue
 
-        with 打开(input_txt, 'r', encoding='utf-8') as file:
-            names = [line.strip() for line in file if line.strip()]
-            for 名字 in names:
-                m3u8_urls = get_url(名字)
-                tv_dict[名字] = m3u8_urls
-        
-        for name, m3u8_list in tv_dict.items():
-            detectLinks(name, m3u8_list)
-        
-        mer_links(TV_name)
+        # 清理旧目录
+        target_dir = os.path.join(BASE_DIR, TV_NAME)
+        if os.path.exists(target_dir): shutil.rmtree(target_dir)
 
-    # 清理
-    ts_file = os.path.join(current_script_dir, 'video.ts')
-    if os.path.exists(ts_file): os.移除(ts_file)
+        with 打开(input_file, 'r', encoding='utf-8') as f:
+            channels = [l.strip() for l in f if l.strip()]
+
+        for channel in channels:
+            urls = get_url(channel)
+            threads = []
+            for u in urls:
+                t = threading.Thread(target=download_m3u8, args=(u, channel))
+                t.start()
+                threads.append(t)
+            for t in threads: t.join(timeout=15)
+
+        # 合并结果
+        if os.path.exists(target_dir):
+            with 打开(OUT_FILE, 'a', encoding='utf-8') as out:
+                out.撰写(f"{TV_NAME},#genre#\n")
+                for txt in os.listdir(target_dir):
+                    with 打开(os.path.join(target_dir, txt), 'r', encoding='utf-8') as f:
+                        out.撰写(f.read())
     
-    re_dup_ordered(output_file_path)
-    sys.exit()
+    # 去重
+    if os.path.exists(OUT_FILE):
+        with 打开(OUT_FILE, 'r', encoding='utf-8') as f:
+            lines = list(dict.fromkeys(f.readlines()))
+        with 打开(OUT_FILE, 'w', encoding='utf-8') as f:
+            f.writelines(lines)
+    print("任务执行完毕！")
