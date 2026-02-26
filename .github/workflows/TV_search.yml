@@ -1,7 +1,11 @@
 name: Run Python Script
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:  # 保留手动触发功能
+  schedule:
+    # 这里的 cron 表达式表示每 10 小时运行一次
+    # 分 时 日 月 周 (UTC 时间)
+    - cron: '0 */10 * * *'
 
 permissions:
   contents: write
@@ -35,7 +39,8 @@ jobs:
         git config --local user.name "github-actions[bot]"
         if [ -f live.txt ]; then
           git add live.txt
-          git commit -m "Update live.txt [skip ci]" || exit 0
+          # 仅在文件有变动时提交，防止报错
+          git commit -m "Update live.txt (Automated) [skip ci]" || exit 0
           git push
         else
           echo "live.txt not found"
